@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Raw Kaggle data and generated intermediate files
+data/
+train.csv
+*.zip
+*.parquet
+models/
+predictions/
+*.log
+
+# Keep only the compact reviewed artifacts committed explicitly
+artifacts/*.csv
+artifacts/*.png
+!artifacts/.gitkeep
+!artifacts/metrics.csv
+!artifacts/per_asset_metrics.csv
+!artifacts/model_comparison.png
