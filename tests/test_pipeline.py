@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from run_experiment import NUMERIC_FEATURES, make_features, time_split
+from run_experiment import NUMERIC_FEATURES, evaluate_long_short_strategy, make_features, time_split
 
 
 def synthetic_frame(periods: int = 100) -> pd.DataFrame:
@@ -44,6 +44,16 @@ class PipelineTests(unittest.TestCase):
         self.assertLess(validation["timestamp"].max(), test["timestamp"].min())
         self.assertTrue(set(train.index).isdisjoint(validation.index))
         self.assertTrue(set(validation.index).isdisjoint(test.index))
+
+    def test_strategy_charges_turnover_cost(self):
+        data = make_features(synthetic_frame(20)).sort_values(["timestamp", "Asset_ID"])
+        data["forward_return_20m"] = data.groupby("Asset_ID")["Close"].transform(
+            lambda series: series.shift(-2) / series - 1
+        )
+        predictions = np.tile([-1.0, 1.0], len(data) // 2)
+        curve, summary = evaluate_long_short_strategy(data, predictions, "test", 10.0)
+        self.assertTrue((curve["net_return"] <= curve["gross_return"]).all())
+        self.assertEqual(summary["transaction_cost_bps"], 10.0)
 
 
 if __name__ == "__main__":
