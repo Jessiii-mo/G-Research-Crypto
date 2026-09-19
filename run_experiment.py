@@ -154,7 +154,8 @@ def fit_and_evaluate(
     test: pd.DataFrame,
     seed: int,
     knn_max_train: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    transaction_cost_bps: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     feature_columns = NUMERIC_FEATURES + ["Asset_ID"]
     preprocessor = build_preprocessor()
     x_train = preprocessor.fit_transform(train[feature_columns]).astype("float32")
@@ -181,6 +182,8 @@ def fit_and_evaluate(
     }
     results: list[dict[str, float | str | int]] = []
     per_asset: list[dict[str, float | str | int]] = []
+    strategy_summaries: list[dict[str, float | str | int]] = []
+    strategy_series: list[pd.DataFrame] = []
 
     predictions: dict[str, np.ndarray] = {"Zero Baseline": np.zeros_like(y_test)}
     runtimes: dict[str, float] = {"Zero Baseline": 0.0}
@@ -212,7 +215,79 @@ def fit_and_evaluate(
             }
             asset_row.update(score_predictions(y_test[mask], predicted[mask]))
             per_asset.append(asset_row)
-    return pd.DataFrame(results), pd.DataFrame(per_asset)
+
+        if name != "Zero Baseline":
+            curve, summary = evaluate_long_short_strategy(
+                test, predicted, name, transaction_cost_bps
+            )
+            strategy_series.append(curve)
+            strategy_summaries.append(summary)
+    return (
+        pd.DataFrame(results),
+        pd.DataFrame(per_asset),
+        pd.DataFrame(strategy_summaries),
+        pd.concat(strategy_series, ignore_index=True),
+    )
+
+
+def evaluate_long_short_strategy(
+    test: pd.DataFrame,
+    predictions: np.ndarray,
+    model_name: str,
+    transaction_cost_bps: float,
+) -> tuple[pd.DataFrame, dict[str, float | str | int]]:
+    """Evaluate a non-overlapping, cross-sectional long-short signal prototype."""
+    strategy = test[["timestamp", "Asset_ID", "forward_return_20m"]].copy()
+    strategy["prediction"] = predictions
+    rebalance_times = np.sort(strategy["timestamp"].unique())[::2]
+    strategy = strategy.loc[
+        strategy["timestamp"].isin(rebalance_times) & strategy["forward_return_20m"].notna()
+    ]
+
+    rows: list[dict[str, float | int | str]] = []
+    previous_weights: dict[int, float] = {}
+    cost_rate = transaction_cost_bps / 10_000
+    for timestamp, cross_section in strategy.groupby("timestamp", sort=True):
+        ranked = cross_section.sort_values("prediction")
+        side_size = max(1, int(np.ceil(len(ranked) * 0.20)))
+        short = ranked.head(side_size)
+        long = ranked.tail(side_size)
+        weights = {
+            **{int(asset): -0.5 / side_size for asset in short["Asset_ID"]},
+            **{int(asset): 0.5 / side_size for asset in long["Asset_ID"]},
+        }
+        gross_return = 0.5 * (
+            float(long["forward_return_20m"].mean())
+            - float(short["forward_return_20m"].mean())
+        )
+        assets = set(previous_weights) | set(weights)
+        turnover = sum(abs(weights.get(asset, 0.0) - previous_weights.get(asset, 0.0)) for asset in assets)
+        net_return = gross_return - turnover * cost_rate
+        rows.append({
+            "model": model_name,
+            "timestamp": int(timestamp),
+            "gross_return": gross_return,
+            "turnover": turnover,
+            "net_return": net_return,
+        })
+        previous_weights = weights
+
+    curve = pd.DataFrame(rows)
+    curve["gross_cumulative_return"] = (1 + curve["gross_return"]).cumprod() - 1
+    curve["net_cumulative_return"] = (1 + curve["net_return"]).cumprod() - 1
+    running_peak = (1 + curve["net_cumulative_return"]).cummax()
+    drawdown = (1 + curve["net_cumulative_return"]) / running_peak - 1
+    summary: dict[str, float | str | int] = {
+        "model": model_name,
+        "rebalances": len(curve),
+        "transaction_cost_bps": transaction_cost_bps,
+        "mean_turnover": float(curve["turnover"].mean()),
+        "gross_total_return": float(curve["gross_cumulative_return"].iloc[-1]),
+        "net_total_return": float(curve["net_cumulative_return"].iloc[-1]),
+        "net_hit_rate": float((curve["net_return"] > 0).mean()),
+        "net_max_drawdown": float(drawdown.min()),
+    }
+    return curve, summary
 
 
 def save_chart(metrics: pd.DataFrame, output_path: Path) -> None:
@@ -229,6 +304,24 @@ def save_chart(metrics: pd.DataFrame, output_path: Path) -> None:
     plt.close(figure)
 
 
+def save_strategy_chart(strategy: pd.DataFrame, output_path: Path) -> None:
+    figure, axes = plt.subplots(1, 2, figsize=(14, 5))
+    for model_name, model_curve in strategy.groupby("model", sort=False):
+        datetime = pd.to_datetime(model_curve["timestamp"], unit="s", utc=True)
+        axes[0].plot(datetime, model_curve["gross_cumulative_return"], label=model_name)
+        axes[1].plot(datetime, model_curve["net_cumulative_return"], label=model_name)
+    axes[0].set_title("Gross cumulative return")
+    axes[1].set_title("Net cumulative return after 10 bps turnover cost")
+    for axis in axes:
+        axis.axhline(0, color="black", linewidth=0.8)
+        axis.set_ylabel("Cumulative return")
+        axis.grid(alpha=0.25)
+        axis.legend(fontsize=8)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(figure)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-path", type=Path, required=True)
@@ -237,6 +330,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-every", type=int, default=10)
     parser.add_argument("--knn-max-train", type=int, default=20_000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--transaction-cost-bps", type=float, default=10.0)
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts"))
     return parser.parse_args()
 
@@ -248,16 +342,25 @@ def main() -> None:
     raw = load_window(args.data_path, args.start_date, args.end_date)
     featured = make_features(clean_data(raw))
     sampled = sample_timestamps(featured, args.sample_every)
+    sampled["forward_return_20m"] = sampled.groupby("Asset_ID")["Close"].transform(
+        lambda series: series.shift(-2) / series - 1
+    )
     train, validation, test = time_split(sampled)
-    metrics, per_asset = fit_and_evaluate(
-        train, validation, test, seed=args.seed, knn_max_train=args.knn_max_train
+    metrics, per_asset, strategy_metrics, strategy_series = fit_and_evaluate(
+        train, validation, test, seed=args.seed, knn_max_train=args.knn_max_train,
+        transaction_cost_bps=args.transaction_cost_bps,
     )
     metrics.insert(1, "source_window_rows", len(raw))
     metrics.insert(2, "modeled_rows", len(sampled))
     metrics.to_csv(args.output_dir / "metrics.csv", index=False)
     per_asset.to_csv(args.output_dir / "per_asset_metrics.csv", index=False)
+    strategy_metrics.to_csv(args.output_dir / "strategy_metrics.csv", index=False)
+    strategy_series.to_csv(args.output_dir / "strategy_timeseries.csv", index=False)
     save_chart(metrics, args.output_dir / "model_comparison.png")
+    save_strategy_chart(strategy_series, args.output_dir / "strategy_cumulative_return.png")
     print(metrics.to_string(index=False))
+    print("\nLong-short strategy prototype:\n")
+    print(strategy_metrics.to_string(index=False))
 
 
 if __name__ == "__main__":

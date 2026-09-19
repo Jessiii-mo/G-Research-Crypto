@@ -20,3 +20,6 @@ artifacts/*.png
 !artifacts/metrics.csv
 !artifacts/per_asset_metrics.csv
 !artifacts/model_comparison.png
+!artifacts/strategy_metrics.csv
+!artifacts/strategy_timeseries.csv
+!artifacts/strategy_cumulative_return.png
